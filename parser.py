@@ -152,52 +152,107 @@ async def parse_avito(url: str) -> dict:
 
 
 async def parse_trudvsem(url: str) -> dict:
-    """Парсим вакансию с trudvsem.ru через открытый API"""
+    """Парсим вакансию с trudvsem.ru через API, с fallback на поиск"""
+
     match = re.search(r"/vacancy/card/(\d+)/([a-f0-9\-]+)", url)
     if not match:
         raise ValueError("Не удалось извлечь ID вакансии из ссылки trudvsem.ru")
 
     company_code = match.group(1)
     vacancy_id = match.group(2)
-    api_url = f"http://opendata.trudvsem.ru/api/v1/vacancies/vacancy/{company_code}/{vacancy_id}"
+
+    # Пробуем прямой запрос к вакансии
+    api_url = f"https://opendata.trudvsem.ru/api/v1/vacancies/vacancy/{company_code}/{vacancy_id}"
+
+    title = ""
+    employer_name = ""
+    salary = ""
+    experience = ""
+    address = ""
+    description = ""
+    inn = ""
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(api_url)
-        if resp.status_code != 200:
-            raise ValueError(f"Trudvsem API вернул {resp.status_code}")
-        data = resp.json()
+        if resp.status_code == 200:
+            data = resp.json()
+            vacancy = data.get("results", {}).get("vacancy", {})
 
-    vacancy = data.get("results", {}).get("vacancy", {})
+            if vacancy:
+                salary_min = vacancy.get("salary_min", "")
+                salary_max = vacancy.get("salary_max", "")
+                if salary_min and salary_max:
+                    salary = f"{salary_min}–{salary_max} руб."
+                elif salary_min:
+                    salary = f"от {salary_min} руб."
+                elif salary_max:
+                    salary = f"до {salary_max} руб."
+                else:
+                    salary = str(vacancy.get("salary", ""))
 
-    salary = vacancy.get("salary", "")
-    salary_min = vacancy.get("salary_min", "")
-    salary_max = vacancy.get("salary_max", "")
-    if salary_min and salary_max:
-        salary = f"{salary_min}–{salary_max} руб."
-    elif salary_min:
-        salary = f"от {salary_min} руб."
-    elif salary_max:
-        salary = f"до {salary_max} руб."
+                company = vacancy.get("company", {})
+                employer_name = company.get("name", "")
+                inn = company.get("inn", "")
+                title = vacancy.get("job-name", "")
+                experience = vacancy.get("requirement", {}).get("experience", "")
+                address = vacancy.get("location", {}).get("location", "")
+                description = vacancy.get("duty", "")
 
-    company = vacancy.get("company", {})
-    employer_name = company.get("name", "")
-    inn = company.get("inn", "")
+    # Если API не дал описание — ищем вакансию через поиск по API
+    if not description:
+        try:
+            search_url = f"https://opendata.trudvsem.ru/api/v1/vacancies?limit=1&offset=0&region={company_code}"
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(search_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    vacancies = data.get("results", {}).get("vacancies", [])
+                    for v in vacancies:
+                        vac = v.get("vacancy", {})
+                        if vac.get("id", "") == vacancy_id or vac.get("job-name", ""):
+                            description = vac.get("duty", "")
+                            if not title:
+                                title = vac.get("job-name", "")
+                            break
+        except Exception:
+            pass
+
+    # Если всё ещё нет описания — собираем из полей то что есть
+    if not description and title:
+        parts = []
+        if title:
+            parts.append(f"Должность: {title}")
+        if employer_name:
+            parts.append(f"Работодатель: {employer_name}")
+        if salary:
+            parts.append(f"Зарплата: {salary}")
+        if experience:
+            parts.append(f"Опыт: {experience}")
+        if address:
+            parts.append(f"Адрес: {address}")
+        parts.append(f"Источник: Работа России (trudvsem.ru)")
+        parts.append(f"Ссылка: {url}")
+        description = "\n".join(parts)
+
+    if not title and not description:
+        raise ValueError(
+            "Не удалось получить данные с trudvsem.ru. "
+            "Пожалуйста, откройте вакансию в браузере, скопируйте весь текст и вставьте его в поле анализа."
+        )
 
     return {
         "source": "trudvsem",
-        "title": vacancy.get("job-name", ""),
+        "title": title,
         "employer": employer_name,
         "employer_url": url,
         "employer_trusted": False,
-        "salary": str(salary),
-        "experience": vacancy.get("requirement", {}).get("experience", ""),
-        "address": vacancy.get("location", {}).get("location", ""),
-        "description": vacancy.get("duty", "")[:4000],
+        "salary": salary,
+        "experience": experience,
+        "address": address,
+        "description": description[:4000],
         "url": url,
         "employer_id": inn,
     }
-
-
 async def parse_vacancy(url: str) -> dict:
     source = detect_source(url)
     if source == "hh":
